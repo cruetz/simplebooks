@@ -1,0 +1,13 @@
+.git
+node_modules
+data
+coverage
+.DS_Store
+backups
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+.env
+.env.*
+!.env.example

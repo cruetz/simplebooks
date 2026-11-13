@@ -1,0 +1,16 @@
+services:
+  simplebooks:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: 3000
+      TZ: ${TZ:-America/Edmonton}
+    ports:
+      - "127.0.0.1:${SIMPLEBOOKS_PORT:-3000}:3000"
+    volumes:
+      - simplebooks-data:/data
+
+volumes:
+  simplebooks-data:
