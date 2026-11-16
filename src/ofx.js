@@ -193,6 +193,12 @@ export function parseStatement(input) {
   const bank = value(accountInfo, 'BANKID');
   const issuer = value(fi, 'FID') || value(signon, 'INTU.BID') || value(fi, 'ORG');
   const institution = kind === 'bank' ? bank || issuer : issuer || bank;
+  const institutionKind = kind === 'bank' && bank ? 'BANKID'
+    : value(fi, 'FID') ? 'FID' : value(signon, 'INTU.BID') ? 'INTU.BID'
+    : value(fi, 'ORG') ? 'ORG' : bank ? 'BANKID' : '';
+  const organization = value(fi, 'ORG');
+  const branch = kind === 'bank' ? value(accountInfo, 'BRANCHID') : '';
+  const accountType = kind === 'bank' ? value(accountInfo, 'ACCTTYPE').toUpperCase() : '';
   const list = child(statement, 'BANKTRANLIST');
   const transactionNodes = list?.children.filter((node) => node.tag === 'STMTTRN') ?? [];
   if (transactionNodes.length !== findAll(statement, ['STMTTRN']).length) throw invalidStructure();
@@ -214,5 +220,16 @@ export function parseStatement(input) {
   const start = from ? date(from, 'start') : earliest || balance?.date || '';
   const end = to ? date(to, 'end') : latest || balance?.date || '';
   if (start && end && start > end) throw new Error('The statement date range is invalid.');
-  return { kind, institution, account, currency, start, end, balance, transactions };
+  // OFX 2.3 §§3.2.7–3.2.8: DTEND is exclusive; omitted time/zone means
+  // midnight GMT. The day-based journal can infer only matching midnight
+  // end/ledger boundaries, with a consistent offset throughout the statement.
+  const midnight = (v) => /^\d{8}(?:000000(?:\.0+)?)?(?:\s*\[[^\]]+\])?$/.test(v);
+  const offset = (v) => Number(v.match(/\[([+-]?\d{1,2}(?:\.\d+)?)/)?.[1] || 0);
+  const zone = offset(from);
+  const balanceCoverage = !!(from && to && balance && balance.date === end &&
+    start < end && midnight(from) && midnight(to) && midnight(value(ledger, 'DTASOF')) &&
+    Math.abs(zone) <= 14 && offset(to) === zone && offset(value(ledger, 'DTASOF')) === zone &&
+    transactionNodes.every((node) => offset(value(node, 'DTPOSTED')) === zone));
+  return { kind, institution, institutionKind, organization, branch, accountType, account, currency,
+    start, end, balance, balanceCoverage, transactions };
 }

@@ -34,6 +34,7 @@ test('parses SGML bank statements with CP1252, stable identities, and exact cent
   const statement = parseStatement(Buffer.from(sgml, 'latin1'));
   assert.deepEqual(statement, {
     kind: 'bank', institution: '0002', account: '00031234', currency: 'CAD',
+    institutionKind: 'BANKID', organization: 'Banque du Nord', branch: '', accountType: 'CHECKING', balanceCoverage: false,
     start: '2026-11-01', end: '2026-11-13', balance: { amount: 12340, date: '2026-11-13' },
     transactions: [
       { id: 'one', date: '2026-11-12', amount: -1010, name: 'Café & Marché', memo: 'Store 2', type: 'DEBIT' },
@@ -46,6 +47,7 @@ test('parses XML QFX credit card signs, text entities, corrections, and fallback
   const statement = parseStatement(Buffer.from(card));
   assert.deepEqual(statement, {
     kind: 'card', institution: '123', account: '0000000000001234', currency: 'CAD',
+    institutionKind: 'FID', organization: '', branch: '', accountType: '', balanceCoverage: false,
     start: '2026-11-12', end: '2026-11-13', balance: { amount: -450, date: '2026-11-13' },
     transactions: [
       { id: 'purchase', date: '2026-11-12', amount: -2000, name: 'Shop & Café', memo: '', type: '' },

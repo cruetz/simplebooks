@@ -184,7 +184,10 @@ function accountsPage(s) {
                a.balance == null ? "Needs balance" : currency(s, a.balance)
              }</strong><small>As of ${date(
                a.updated || a.date || a.asOf,
-             )}</small></div></div><details><summary>Update starting balance</summary>${form(
+             )}</small></div></div><p class="fine">${a.opening == null
+               ? 'Transactions are saved. Add a known balance and its date to resolve this account.'
+               : `Starting balance ${currency(s, a.opening)} as of ${date(a.opening_date)}. Earlier transactions remain in history.`
+             }</p><details><summary>Update starting balance</summary>${form(
                "/accounts/balance",
                `<input type="hidden" name="account" value="${h(
                  a.id,
@@ -401,14 +404,15 @@ function importPage(s) {
     "Repeated imports are safe. Previously imported bank IDs are skipped.",
     form(
       "/import",
-      `${accountSelect(
-        s.accounts || [],
-      )}<label>Statement file<input name="statement" type="file" accept=".ofx,.qfx,application/x-ofx" required></label><label class="check"><input type="checkbox" name="applyBalance"> Use the statement closing balance as the account balance</label>${button(
+      `<label>Account<select name="account">${options(
+        (s.accounts || []).filter((a) => ['bank', 'card'].includes(a.type)),
+        'Automatically match or create',
+      )}<option value="new">Create a new account (confirm a separate account)</option></select></label><p class="fine">Choose an existing account for its first import if you already track it. Missing or masked account details require an explicit choice.</p><label>Statement file<input name="statement" type="file" accept=".ofx,.qfx,application/x-ofx" required></label>${button(
         "Import statement",
       )}`,
       'enctype="multipart/form-data"',
     ),
-  )}<div class="notice"><strong>Before you import</strong><p>Set an opening balance and its date on the account. Earlier transactions stay visible without being counted twice.</p></div>`;
+  )}<div class="notice"><strong>No account setup required</strong><p>We match the full statement identity or create an account. A complete dated statement can establish the starting balance before its transaction range. Otherwise, transactions are still saved and the account shows Needs balance. Set a known dated balance on <a href="/accounts">Accounts</a> when ready.</p><p>Later and older imports preserve an existing starting balance. Earlier transactions stay visible without being counted twice.</p></div>`;
 }
 function receiptsPage(s) {
   const receipts = s.receipts || [],

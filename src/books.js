@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 const id = () => randomUUID();
 const today = () => {
@@ -54,7 +54,6 @@ export class Books {
       .exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, included INTEGER NOT NULL, opening INTEGER, opening_date TEXT, currency TEXT NOT NULL, institution TEXT, source_account TEXT, updated TEXT);
-      CREATE UNIQUE INDEX IF NOT EXISTS account_source ON accounts(institution,source_account,type) WHERE source_account IS NOT NULL;
       CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, date TEXT NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL, explicit INTEGER NOT NULL DEFAULT 0, memo TEXT, key TEXT UNIQUE);
       CREATE TABLE IF NOT EXISTS lines (id TEXT PRIMARY KEY, entry TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE, account TEXT REFERENCES accounts(id), amount INTEGER NOT NULL, currency TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 1, posted TEXT NOT NULL, dimension TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS request_keys (kind TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(kind,key));
@@ -72,6 +71,14 @@ export class Books {
       CREATE INDEX IF NOT EXISTS lines_amount ON lines(amount);
       CREATE INDEX IF NOT EXISTS imports_entry ON imports(entry);
     `);
+    // Preserve legacy mappings and balances; a first explicit selection confirms
+    // the richer identity before future imports may match automatically.
+    this.atomic(() => {
+      if (!this.all('PRAGMA table_info(accounts)').some((c) => c.name === 'source_identity'))
+        this.db.exec('ALTER TABLE accounts ADD COLUMN source_identity TEXT');
+      this.db.exec(`DROP INDEX IF EXISTS account_source;
+        CREATE INDEX IF NOT EXISTS account_identity ON accounts(source_identity)`);
+    });
   }
   close() {
     this.db.close();
@@ -392,29 +399,85 @@ export class Books {
     );
     return entry;
   }
+  resolveImportAccount(accountId, statement) {
+    if (!['bank', 'card'].includes(statement.kind)) throw new Error('Invalid statement account type');
+    if (statement.currency !== this.currency()) throw new Error('Statement currency does not match');
+    const source = name(statement.account);
+    const institution = String(statement.institution || '');
+    const parts = [statement.kind, statement.currency,
+      statement.institutionKind || '', institution, statement.branch || '',
+      statement.accountType || '', source,
+      statement.institutionKind === 'FID' ? statement.organization || '' : ''];
+    const identity = JSON.stringify(parts);
+    const compatible = (other) => parts.every((part, i) => !part || !other[i] || part === other[i]);
+    const strong = !!institution && statement.institutionKind !== 'ORG' &&
+      (statement.institutionKind !== 'FID' || !!statement.organization) && !/[*xX\u2022]/.test(source);
+    const matches = this.all('SELECT * FROM accounts WHERE source_identity=?', identity);
+    let created = false;
+    if (!accountId) {
+      const candidates = this.all('SELECT * FROM accounts WHERE source_account=? AND type=?', source, statement.kind)
+        .filter((a) => a.source_identity ? compatible(JSON.parse(a.source_identity))
+          : !a.institution || a.institution === institution);
+      if (!strong || matches.length > 1)
+        throw new Error('Select an account, or choose Create a new account: the statement identity is incomplete or ambiguous.');
+      if (candidates.some((a) => a.id !== matches[0]?.id))
+        throw new Error('Select an account to confirm the existing statement mapping, or choose Create a new account.');
+      if (matches.length === 1) accountId = matches[0].id;
+      else accountId = 'new';
+    }
+    if (strong && matches.length && !matches.some((a) => a.id === accountId))
+      throw new Error('This statement account is already mapped to another tracked account. Select that account or use automatic matching.');
+    if (accountId === 'new') {
+      accountId = id();
+      this.run('INSERT INTO accounts(id,name,type,included,currency) VALUES(?,?,?,?,?)',
+        accountId, `${statement.kind === 'card' ? 'Card' : statement.accountType || 'Bank'} ${statement.organization ? `${statement.organization} ` : ''}${institution || 'account'} ending ${source.slice(-4)}${statement.branch ? ` branch ${statement.branch}` : ''}`,
+        statement.kind, statement.kind === 'bank' ? 1 : 0, statement.currency);
+      created = true;
+    }
+    const account = this.account(accountId);
+    if (statement.kind !== account.type) throw new Error('Statement account type does not match');
+    if (statement.currency !== account.currency) throw new Error('Statement currency does not match');
+    if ((account.source_identity && !compatible(JSON.parse(account.source_identity))) ||
+      (account.source_account && (account.source_account !== source ||
+        (account.institution && institution && account.institution !== institution))))
+      throw new Error('This account is already mapped to a different statement account');
+    const previous = account.source_identity && JSON.parse(account.source_identity);
+    const confirmed = previous ? JSON.stringify(parts.map((part, i) => part || previous[i])) : identity;
+    this.run('UPDATE accounts SET institution=?,source_account=?,source_identity=? WHERE id=?',
+      institution || account.institution || '', source, confirmed, accountId);
+    return { account: this.account(accountId), created };
+  }
+  initializeImportBalance(accountId, statement) {
+    if (this.account(accountId).opening !== null || !statement.balance || !statement.balanceCoverage) return;
+    const rows = statement.transactions;
+    if (rows.some((tx) => tx.correctId || tx.correctAction || tx.date < statement.start || tx.date >= statement.end) ||
+      this.get('SELECT 1 FROM corrections WHERE account=?', accountId) ||
+      this.get('SELECT 1 FROM suppressed_imports WHERE account=?', accountId)) return;
+    const sourceIds = new Set(rows.map((tx) => String(tx.id)));
+    const lines = this.all(`SELECT l.id,l.entry FROM lines l WHERE l.account=? AND l.posted>=? AND l.posted<?
+      AND l.entry NOT IN (SELECT id FROM entries WHERE category='Opening balance')`, accountId, statement.start, statement.end);
+    if (lines.some((line) => !this.all('SELECT source_id FROM imports WHERE account=? AND entry=?', accountId, line.entry)
+      .some((i) => sourceIds.has(i.source_id)))) return;
+    // Sum unique bank IDs, not only newly added rows: overlap must not change
+    // the opening implied by a complete statement. BigInt avoids rounding.
+    const unique = new Map(rows.map((tx) => [String(tx.id), tx]));
+    const movement = [...unique.values()].reduce((sum, tx) => sum + BigInt(integer(tx.amount)), 0n);
+    const opening = Number(BigInt(integer(statement.balance.amount)) - movement);
+    if (!Number.isSafeInteger(opening)) return;
+    const before = new Date(`${date(statement.start)}T00:00:00Z`);
+    before.setUTCDate(before.getUTCDate() - 1);
+    const openingDate = before.toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(openingDate)) return;
+    this.applyBalance(accountId, opening, openingDate);
+  }
   importStatement(accountId, statement, options = {}) {
     return this.atomic(() => {
-      const account = this.account(accountId);
-      if (statement.kind !== account.type)
-        throw new Error("Statement account type does not match");
-      if (statement.currency !== account.currency)
-        throw new Error("Statement currency does not match");
-      const institution = String(statement.institution || "");
-      const source = name(statement.account);
-      if (
-        account.source_account &&
-        (account.source_account !== source ||
-          account.institution !== institution)
-      )
-        throw new Error(
-          "This account is already mapped to a different statement account",
-        );
-      this.run(
-        "UPDATE accounts SET institution=?,source_account=? WHERE id=?",
-        institution,
-        source,
-        accountId,
-      );
+      const request = { key: options.key, account: accountId || '',
+        statement: createHash('sha256').update(JSON.stringify(statement)).digest('hex') };
+      const prior = this.retry('import', request);
+      if (prior) return JSON.parse(prior);
+      const { account, created } = this.resolveImportAccount(accountId, statement);
+      accountId = account.id;
       let added = 0,
         duplicate = 0,
         flagged = 0;
@@ -463,6 +526,12 @@ export class Books {
         }
         date(tx.date);
         integer(tx.amount);
+        const existing = this.get(`SELECT l.amount,l.posted FROM imports i JOIN lines l
+          ON l.entry=i.entry AND l.account=i.account WHERE i.account=? AND i.source_id=?`, accountId, String(tx.id));
+        if (existing && (existing.amount !== tx.amount || existing.posted !== tx.date) &&
+          !this.get('SELECT 1 FROM corrections WHERE account=? AND resolved=1 AND (original_id=? OR source_id=?)',
+            accountId, String(tx.id), String(tx.id)))
+          throw new Error('Transaction ID conflicts with previously imported details. Review the bank statement before importing.');
         if (
           this.get(
             "SELECT 1 FROM imports WHERE account=? AND source_id=?",
@@ -596,26 +665,22 @@ export class Books {
         }
         added++;
       }
-      if (options.applyBalance) {
-        if (!statement.balance)
-          throw new Error("Statement has no closing balance");
-        this.applyBalance(
-          accountId,
-          integer(statement.balance.amount),
-          date(statement.balance.date),
-        );
-      }
+      this.initializeImportBalance(accountId, statement);
       if (statement.end) this.expandRecurrences(date(statement.end));
       this.matchReceipts();
       this.matchBills();
-      return {
+      const result = {
         added,
         duplicate,
         flagged,
         account: accountId,
+        created,
+        needsBalance: this.account(accountId).opening === null,
         start: statement.start,
         end: statement.end,
       };
+      this.remember('import', request, JSON.stringify(result));
+      return result;
     });
   }
   addBill(v) {

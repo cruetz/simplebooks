@@ -242,14 +242,16 @@ export function createApp({
           if (!file || typeof file === "string" || !file.size)
             throw new Error("Choose a statement file");
           const parsed = parseStatement(Buffer.from(await file.arrayBuffer()));
-          const result = books.importStatement(get("account"), parsed, {
-            applyBalance: get("applyBalance") === "on",
-          });
+          const result = books.importStatement(get("account"), parsed, { key: get("key") });
           message = `Imported ${result.added} new, ${
             result.duplicate
           } previously imported, and ${result.flagged} flagged transactions (${
             result.start || "unknown date"
           } to ${result.end || "unknown date"}).`;
+          message += ` ${result.created ? 'Created' : 'Matched'} ${books.account(result.account).name}.`;
+          message += result.needsBalance
+            ? ' This account needs a balance. Transactions are saved; review its starting balance on Accounts.'
+            : ' The account balance is ready; existing starting balances are preserved.';
           break;
         }
         case "/receipts": {

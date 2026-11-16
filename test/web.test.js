@@ -4,17 +4,21 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../src/server.js";
+import { Books } from "../src/books.js";
 
 async function setup(t) {
   const dir = mkdtempSync(join(tmpdir(), "simplebooks-web-"));
   const app = createApp({ dataDir: dir });
+  const servers = [app], databases = [];
   await new Promise((resolve) => app.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${app.address().port}`;
   t.after(async () => {
-    if (app.listening) await new Promise((resolve) => app.close(resolve));
+    for (const server of servers)
+      if (server.listening) await new Promise((resolve) => server.close(resolve));
+    for (const db of databases) db.close();
     rmSync(dir, { recursive: true, force: true });
   });
-  return { base, app, dir };
+  return { base, app, dir, servers, databases };
 }
 
 test("dashboard renders and rejects cross-origin form submissions", async (t) => {
@@ -34,7 +38,7 @@ test("dashboard renders and rejects cross-origin form submissions", async (t) =>
 });
 
 test("account form persists across a server restart", async (t) => {
-  const { base, app, dir } = await setup(t);
+  const { base, app, dir, servers } = await setup(t);
   const response = await fetch(`${base}/accounts`, {
     method: "POST",
     redirect: "manual",
@@ -48,7 +52,7 @@ test("account form persists across a server restart", async (t) => {
   await new Promise((resolve) => app.close(resolve));
   const reopened = createApp({ dataDir: dir });
   await new Promise((resolve) => reopened.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => reopened.close(resolve)));
+  servers.push(reopened);
   const page = await fetch(
     `http://127.0.0.1:${reopened.address().port}/accounts`,
   );
@@ -131,4 +135,52 @@ test("imported statement updates the payday dashboard once across retries", asyn
   const dashboard = await (await fetch(base)).text();
   assert.match(dashboard, /\$790\.00/);
   assert.match(dashboard, /Dining/);
+});
+
+const autoStatement = '<OFX><STMTRS><CURDEF>CAD<BANKACCTFROM><BANKID>002<ACCTID>000123<ACCTTYPE>CHECKING</BANKACCTFROM><BANKTRANLIST><DTSTART>20261101<DTEND>20261115<STMTTRN><DTPOSTED>20261101<TRNAMT>-10<FITID>one<NAME>Shop</STMTTRN></BANKTRANLIST><LEDGERBAL><BALAMT>90<DTASOF>20261115</LEDGERBAL></STMTRS></OFX>';
+async function upload(base, statement = autoStatement, account = '') {
+  const data = new FormData();
+  data.set('statement', new Blob([statement]), 'statement.ofx');
+  if (account) data.set('account', account);
+  return fetch(base + '/import', { method: 'POST', redirect: 'manual', headers: { origin: base }, body: data });
+}
+
+test('empty installation can import through the form, repeat, and reopen with a derived balance', async (t) => {
+  const { base, app, dir, databases } = await setup(t);
+  const form = await (await fetch(base + '/import')).text();
+  assert.match(form, /Automatically match or create/);
+  assert.doesNotMatch(form, /<select name="account" required/);
+  assert.equal((await upload(base)).status, 303);
+  const repeat = await upload(base);
+  assert.equal(repeat.status, 303);
+  assert.match(decodeURIComponent(repeat.headers.get('location')), /0 new, 1 previously imported/);
+  assert.match(await (await fetch(base + '/accounts')).text(), /\$90\.00/);
+  await new Promise((resolve) => app.close(resolve));
+  const b = new Books(join(dir, 'simplebooks.sqlite'));
+  databases.push(b);
+  const s = b.snapshot('2026-11-15');
+  assert.equal(s.accounts.length, 1);
+  assert.equal(s.transactions.length, 1);
+  assert.equal(s.accounts[0].opening, 10000);
+  assert.equal(b.importStatement('', (await import('../src/ofx.js')).parseStatement(autoStatement)).duplicate, 1);
+});
+
+test('unanchored upload succeeds and offers account-specific balance correction', async (t) => {
+  const { base } = await setup(t);
+  const response = await upload(base, autoStatement.replace(/<LEDGERBAL>.*?<\/LEDGERBAL>/, ''));
+  assert.equal(response.status, 303);
+  assert.match(decodeURIComponent(response.headers.get('location')), /needs a balance/i);
+  const accounts = await (await fetch(base + '/accounts')).text();
+  assert.match(accounts, /Needs balance/);
+  assert.match(accounts, /action="\/accounts\/balance"/);
+  assert.match(await (await fetch(base + '/transactions')).text(), /Shop/);
+});
+
+test('weak identity can create an account explicitly without pre-creating a balance', async (t) => {
+  const { base } = await setup(t);
+  const weak = autoStatement.replace('<BANKID>002', '');
+  const response = await upload(base, weak);
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Select an account/i);
+  assert.equal((await upload(base, weak, 'new')).status, 303);
 });
