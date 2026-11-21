@@ -39,6 +39,9 @@ test("dashboard renders and rejects cross-origin form submissions", async (t) =>
 
 test("account form persists across a server restart", async (t) => {
   const { base, app, dir, servers } = await setup(t);
+  const formPage = await fetch(`${base}/accounts`);
+  // Browsers send Origin: null on a form POST from a no-referrer page.
+  assert.equal(formPage.headers.get("referrer-policy"), "same-origin");
   const response = await fetch(`${base}/accounts`, {
     method: "POST",
     redirect: "manual",

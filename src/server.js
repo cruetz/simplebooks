@@ -21,7 +21,7 @@ function reply(
   res.writeHead(status, {
     "Content-Type": type,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "Content-Security-Policy":
       "default-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     ...headers,
